@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/mcbrs-nethernet"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/MCB-RS/MCBRS-NetherNet"
+authors = ["MCBRS contributors"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }

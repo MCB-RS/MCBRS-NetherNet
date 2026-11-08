@@ -1,0 +1,39 @@
+# --- Rust / Cargo ---
+/target/
+**/target/
+# Library crates should not commit Cargo.lock, but this workspace will ship
+# server binaries, so Cargo.lock is intentionally tracked.
+**/*.rs.bk
+*.pdb
+
+# --- Secrets: NetherNet operator keys (never commit these!) ---
+*.pem
+*.key
+*.p8
+nethernet_server_key.*
+
+# --- Runtime data produced by servers ---
+/worlds/
+/players/
+/logs/
+*.log
+
+# --- Environment / local config ---
+.env
+.env.*
+!.env.example
+
+# --- IDE / editors ---
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+.fleet/
+.zed/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+desktop.ini
