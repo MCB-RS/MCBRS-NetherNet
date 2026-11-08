@@ -30,11 +30,11 @@ pub struct ServerInfo {
 }
 
 impl Default for ServerInfo {
-    /// Values taken from the guide's example; the game layer is expected to
+    /// Values taken from the guide's example; the application is expected to
     /// overwrite them with the real protocol/version it implements.
     fn default() -> Self {
         Self {
-            name: "MCBRS Server".into(),
+            name: "NetherNet Server".into(),
             protocol: 2177,
             version: "1.26.50".into(),
             level: "Bedrock level".into(),

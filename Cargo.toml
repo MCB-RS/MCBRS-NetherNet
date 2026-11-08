@@ -1,14 +1,40 @@
-[workspace]
-resolver = "3"
-members = ["crates/mcbrs-nethernet"]
-
-[workspace.package]
+[package]
+name = "mcbrs-nethernet"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
+description = "NetherNet transport for Minecraft Bedrock in Rust: HTTP signaling, WebRTC data channels, identity assertions and framing"
 license = "MIT"
 repository = "https://github.com/MCB-RS/MCBRS-NetherNet"
+readme = "README.md"
 authors = ["MCBRS contributors"]
+keywords = ["minecraft", "bedrock", "nethernet", "webrtc", "networking"]
+categories = ["network-programming", "game-development"]
 
-[workspace.dependencies]
+[dependencies]
+# Async runtime & HTTP signaling
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "json"] }
+async-trait = "0.1"
+
+# WebRTC (DTLS + SCTP data channels)
+webrtc = "0.21"
+rtc = { version = "0.21", default-features = false }
+bytes = "1"
+
+# Identity assertions (JWT / detached JWS, ES256 + ES384)
+p256 = { version = "0.13", features = ["ecdsa", "jwk", "pem", "pkcs8"] }
+p384 = { version = "0.13", features = ["ecdsa", "jwk", "pem", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+sha2 = "0.10"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Misc
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.13", default-features = false }

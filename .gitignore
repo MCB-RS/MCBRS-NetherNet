@@ -1,8 +1,6 @@
 # --- Rust / Cargo ---
 /target/
-**/target/
-# Library crates should not commit Cargo.lock, but this workspace will ship
-# server binaries, so Cargo.lock is intentionally tracked.
+# Cargo.lock is tracked on purpose (reproducible builds of the example and tests).
 **/*.rs.bk
 *.pdb
 
@@ -12,10 +10,7 @@
 *.p8
 nethernet_server_key.*
 
-# --- Runtime data produced by servers ---
-/worlds/
-/players/
-/logs/
+# --- Logs ---
 *.log
 
 # --- Environment / local config ---

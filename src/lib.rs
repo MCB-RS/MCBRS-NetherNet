@@ -1,7 +1,6 @@
 //! # mcbrs-nethernet
 //!
-//! NetherNet transport layer for **MCBRS**, a Minecraft Bedrock server
-//! framework written in Rust.
+//! **MCBRS-NetherNet**: Minecraft Bedrock's NetherNet transport, written in Rust.
 //!
 //! NetherNet is Minecraft's peer-to-peer transport built on WebRTC data
 //! channels. This crate implements the *server* side of the
