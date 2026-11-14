@@ -74,6 +74,9 @@ pub fn strip_identity(sdp: &str) -> String {
 /// `a=fingerprint` lines and before the first `m=` line (any existing
 /// `a=identity` line is replaced).
 pub fn insert_identity(sdp: &str, value: &str) -> String {
+    // The value is base64 in practice; never let a caller inject extra SDP lines.
+    let value: String = value.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    let value = value.as_str();
     let eol = line_ending(sdp);
     let stripped = strip_identity(sdp);
     let all: Vec<&str> = lines(&stripped).collect();
@@ -190,6 +193,12 @@ a=candidate:1 1 udp 2130706431 192.168.1.100 12345 typ host\r\n";
             with,
             "v=0\ns=-\na=identity:ID\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\na=fingerprint:sha-256 AA\n"
         );
+    }
+
+    #[test]
+    fn identity_value_cannot_inject_lines() {
+        let with = insert_identity("v=0\nm=application 9\n", "AAA\r\na=evil:1");
+        assert_eq!(with, "v=0\na=identity:AAAa=evil:1\nm=application 9\n");
     }
 
     #[test]

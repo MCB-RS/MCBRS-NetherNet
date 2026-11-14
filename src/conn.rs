@@ -2,10 +2,10 @@
 //! WebRTC peer connection), with NetherNet framing applied transparently.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 
-use bytes::{Bytes, BytesMut};
-use tokio::sync::{Mutex, mpsc, watch};
+use bytes::Bytes;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::PeerConnection;
 
@@ -55,25 +55,38 @@ pub struct Message {
     pub payload: Bytes,
 }
 
+/// A received message waiting in the connection queue, together with the
+/// share of the incoming byte budget it holds until `recv()` hands it out.
+struct Queued {
+    message: Message,
+    _budget: OwnedSemaphorePermit,
+}
+
+type ChannelSlot = StdMutex<Option<Arc<dyn DataChannel>>>;
+
 /// State shared between the connection handle, the peer-connection event
 /// handler and the data channel pumps.
 pub(crate) struct Shared {
     pub(crate) network_id: String,
     closed: watch::Sender<bool>,
     reliable_open: watch::Sender<bool>,
-    reliable: StdMutex<Option<Arc<dyn DataChannel>>>,
-    unreliable: StdMutex<Option<Arc<dyn DataChannel>>>,
-    msg_tx: mpsc::Sender<Message>,
+    reliable: ChannelSlot,
+    unreliable: ChannelSlot,
+    msg_tx: mpsc::Sender<Queued>,
     max_incoming_message_size: usize,
+    /// Bytes of received-but-unread messages, see `max_buffered_incoming_bytes`.
+    budget: Arc<Semaphore>,
+    budget_size: usize,
 }
 
 impl Shared {
     pub(crate) fn new(
         network_id: String,
         max_incoming_message_size: usize,
-        buffer: usize,
-    ) -> (Arc<Self>, mpsc::Receiver<Message>) {
-        let (msg_tx, msg_rx) = mpsc::channel(buffer);
+        max_buffered_incoming_bytes: usize,
+        queue_len: usize,
+    ) -> (Arc<Self>, ConnReceiver) {
+        let (msg_tx, msg_rx) = mpsc::channel(queue_len);
         let shared = Arc::new(Self {
             network_id,
             closed: watch::channel(false).0,
@@ -82,8 +95,10 @@ impl Shared {
             unreliable: StdMutex::new(None),
             msg_tx,
             max_incoming_message_size,
+            budget: Arc::new(Semaphore::new(max_buffered_incoming_bytes)),
+            budget_size: max_buffered_incoming_bytes,
         });
-        (shared, msg_rx)
+        (shared, ConnReceiver(msg_rx))
     }
 
     pub(crate) fn close(&self) {
@@ -106,11 +121,11 @@ impl Shared {
         let mut open = self.reliable_open.subscribe();
         tokio::select! {
             res = open.wait_for(|o| *o) => res.is_ok() && !self.is_closed(),
-            _ = self.closed() => false,
+            () = self.closed() => false,
         }
     }
 
-    fn slot(&self, channel: Channel) -> &StdMutex<Option<Arc<dyn DataChannel>>> {
+    fn slot(&self, channel: Channel) -> &ChannelSlot {
         match channel {
             Channel::Reliable => &self.reliable,
             Channel::Unreliable => &self.unreliable,
@@ -118,70 +133,156 @@ impl Shared {
     }
 
     fn channel(&self, channel: Channel) -> Option<Arc<dyn DataChannel>> {
-        self.slot(channel).lock().expect("poisoned").clone()
+        // No user code runs under this lock, but never turn a poisoned lock into
+        // a panic on the network path.
+        self.slot(channel)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
-    fn set_channel(&self, channel: Channel, dc: Option<Arc<dyn DataChannel>>) {
-        *self.slot(channel).lock().expect("poisoned") = dc;
+    /// Registers `dc` for `channel`. Returns `false` if a channel with the same
+    /// label is already registered (a client may not open duplicates).
+    fn claim_channel(&self, channel: Channel, dc: &Arc<dyn DataChannel>) -> bool {
+        let mut slot = self
+            .slot(channel)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(dc.clone());
+        true
     }
+
+    fn release_channel(&self, channel: Channel) {
+        *self
+            .slot(channel)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Budget cost of a payload (a message larger than the whole budget still
+    /// gets through, alone).
+    fn cost(&self, len: usize) -> u32 {
+        // `budget_size <= u32::MAX` is enforced by `NetherNetConfig::validate`.
+        u32::try_from(len.min(self.budget_size)).unwrap_or(u32::MAX)
+    }
+}
+
+/// Receiving half of a connection's message queue.
+pub(crate) struct ConnReceiver(mpsc::Receiver<Queued>);
+
+/// Checks that the reliable channel really has the reliable, ordered semantics
+/// the reassembler relies on.
+async fn has_reliable_semantics(dc: &Arc<dyn DataChannel>) -> bool {
+    matches!(dc.ordered().await, Ok(true))
+        && matches!(dc.max_retransmits().await, Ok(None))
+        && matches!(dc.max_packet_life_time().await, Ok(None))
 }
 
 /// Reads events of one data channel, applies NetherNet framing and forwards
 /// complete messages to the connection.
 pub(crate) async fn pump_data_channel(shared: Arc<Shared>, dc: Arc<dyn DataChannel>) {
+    let network_id = shared.network_id.as_str();
     let label = dc.label().await.unwrap_or_default();
     let Some(channel) = Channel::from_label(&label) else {
-        tracing::warn!(network_id = %shared.network_id, %label, "closing unexpected data channel");
+        tracing::warn!(%network_id, label = %label.escape_debug(), "closing unexpected data channel");
         let _ = dc.close().await;
         return;
     };
-    tracing::debug!(network_id = %shared.network_id, %label, "data channel open");
-    shared.set_channel(channel, Some(dc.clone()));
+    if channel == Channel::Reliable && !has_reliable_semantics(&dc).await {
+        tracing::warn!(%network_id, "closing ReliableDataChannel opened as unordered/unreliable");
+        let _ = dc.close().await;
+        return;
+    }
+    if !shared.claim_channel(channel, &dc) {
+        tracing::warn!(%network_id, %label, "closing duplicate data channel");
+        let _ = dc.close().await;
+        return;
+    }
+    tracing::debug!(%network_id, %label, "data channel open");
     if channel == Channel::Reliable {
         shared.reliable_open.send_replace(true);
     }
 
+    let mut closed = shared.closed.subscribe();
     let mut reassembler = Reassembler::new(shared.max_incoming_message_size);
     loop {
         let event = tokio::select! {
             event = dc.poll() => event,
-            _ = shared.closed() => break,
+            _ = closed.wait_for(|c| *c) => break,
         };
-        match event {
-            Some(DataChannelEvent::OnMessage(msg)) => {
-                let payload = match channel {
-                    Channel::Reliable => match reassembler.push(&msg.data) {
-                        Ok(Some(payload)) => payload,
-                        Ok(None) => continue,
-                        Err(e) => {
-                            tracing::warn!(network_id = %shared.network_id, "closing connection: {e}");
-                            shared.close();
-                            break;
-                        }
-                    },
-                    Channel::Unreliable => match framing::parse_single(&msg.data) {
-                        Ok(payload) => Bytes::copy_from_slice(payload),
-                        Err(e) => {
-                            tracing::debug!(network_id = %shared.network_id, "dropping unreliable message: {e}");
-                            continue;
-                        }
-                    },
-                };
-                let message = Message { channel, payload };
-                tokio::select! {
-                    res = shared.msg_tx.send(message) => if res.is_err() { break },
-                    _ = shared.closed() => break,
-                }
-            }
+        let msg = match event {
+            Some(DataChannelEvent::OnMessage(msg)) => msg,
             Some(DataChannelEvent::OnClose) | None => {
-                tracing::debug!(network_id = %shared.network_id, %label, "data channel closed");
-                shared.set_channel(channel, None);
+                tracing::debug!(%network_id, %label, "data channel closed");
+                shared.release_channel(channel);
                 if channel == Channel::Reliable {
                     shared.close();
                 }
                 break;
             }
-            Some(_) => {}
+            Some(_) => continue,
+        };
+
+        match channel {
+            Channel::Reliable => {
+                let payload = match reassembler.push_owned(msg.data) {
+                    Ok(Some(payload)) => payload,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(%network_id, "closing connection: {e}");
+                        shared.close();
+                        break;
+                    }
+                };
+                // Reliable data must not be lost: wait for budget and queue room.
+                // While we wait, webrtc-rs stops draining SCTP, so the peer is
+                // throttled by flow control instead of growing our memory.
+                let cost = shared.cost(payload.len());
+                let budget = tokio::select! {
+                    permit = shared.budget.clone().acquire_many_owned(cost) => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    },
+                    _ = closed.wait_for(|c| *c) => break,
+                };
+                let queued = Queued {
+                    message: Message { channel, payload },
+                    _budget: budget,
+                };
+                tokio::select! {
+                    res = shared.msg_tx.send(queued) => if res.is_err() { break },
+                    _ = closed.wait_for(|c| *c) => break,
+                }
+            }
+            Channel::Unreliable => {
+                let payload = match framing::parse_single_owned(msg.data) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        tracing::debug!(%network_id, "dropping unreliable message: {e}");
+                        continue;
+                    }
+                };
+                // Loss is acceptable here: never block (that would stall the
+                // reliable channel too), drop when the application lags behind.
+                let Ok(budget) = shared
+                    .budget
+                    .clone()
+                    .try_acquire_many_owned(shared.cost(payload.len()))
+                else {
+                    tracing::trace!(%network_id, "incoming budget exhausted, dropping unreliable message");
+                    continue;
+                };
+                let queued = Queued {
+                    message: Message { channel, payload },
+                    _budget: budget,
+                };
+                if let Err(mpsc::error::TrySendError::Closed(_)) = shared.msg_tx.try_send(queued) {
+                    break;
+                }
+            }
         }
     }
 }
@@ -192,7 +293,7 @@ pub(crate) async fn pump_data_channel(shared: Arc<Shared>, dc: Arc<dyn DataChann
 pub struct NetherNetConnection {
     shared: Arc<Shared>,
     pc: Arc<dyn PeerConnection>,
-    rx: Mutex<mpsc::Receiver<Message>>,
+    rx: Mutex<ConnReceiver>,
     send_lock: Mutex<()>,
     max_message_size: usize,
     identity: Option<ClientIdentity>,
@@ -214,7 +315,7 @@ impl NetherNetConnection {
     pub(crate) fn new(
         shared: Arc<Shared>,
         pc: Arc<dyn PeerConnection>,
-        rx: mpsc::Receiver<Message>,
+        rx: ConnReceiver,
         max_message_size: usize,
         identity: Option<ClientIdentity>,
         signaling_addr: Option<SocketAddr>,
@@ -259,29 +360,41 @@ impl NetherNetConnection {
     /// Returns `None` once the connection is closed and drained.
     pub async fn recv(&self) -> Option<Message> {
         let mut rx = self.rx.lock().await;
-        tokio::select! {
+        let queued = tokio::select! {
             biased;
-            message = rx.recv() => message,
-            _ = self.shared.closed() => rx.try_recv().ok(),
-        }
+            queued = rx.0.recv() => queued,
+            () = self.shared.closed() => rx.0.try_recv().ok(),
+        };
+        // Dropping the permit gives the bytes back to the incoming budget.
+        queued.map(|q| q.message)
     }
 
     /// Sends a message on the reliable channel, fragmenting it if needed.
+    ///
+    /// Waits while the channel's send buffer is full (see
+    /// [`crate::NetherNetConfig::send_buffer_limit`]); returns
+    /// [`Error::Closed`] if the connection closes meanwhile.
     pub async fn send(&self, payload: &[u8]) -> Result<()> {
         if self.is_closed() {
             return Err(Error::Closed);
         }
-        let frames = framing::fragment(payload, self.max_message_size)?;
+        let frames = framing::fragment_mut(payload, self.max_message_size)?;
         let dc = self
             .shared
             .channel(Channel::Reliable)
             .ok_or(Error::Closed)?;
         // Fragments of two messages must never interleave.
         let _guard = self.send_lock.lock().await;
-        for frame in frames {
-            dc.send(BytesMut::from(frame)).await?;
+        let send_all = async {
+            for frame in frames {
+                dc.send(frame).await?;
+            }
+            Ok(())
+        };
+        tokio::select! {
+            res = send_all => res,
+            () = self.shared.closed() => Err(Error::Closed),
         }
-        Ok(())
     }
 
     /// Sends a message on the unreliable channel (may be lost or reordered).
@@ -295,9 +408,11 @@ impl NetherNetConnection {
         }
         match self.shared.channel(Channel::Unreliable) {
             Some(dc) => {
-                let frame = framing::frame_single(payload, self.max_message_size)?;
-                dc.send(BytesMut::from(frame)).await?;
-                Ok(())
+                let frame = framing::frame_single_mut(payload, self.max_message_size)?;
+                tokio::select! {
+                    res = dc.send(frame) => res.map_err(Error::from),
+                    () = self.shared.closed() => Err(Error::Closed),
+                }
             }
             None => self.send(payload).await,
         }
@@ -323,6 +438,8 @@ impl NetherNetConnection {
 impl Drop for NetherNetConnection {
     fn drop(&mut self) {
         self.shared.close();
+        // `PeerConnection::close` is async; outside a runtime the driver task is
+        // already gone with it, so there is nothing left to release.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let pc = self.pc.clone();
             handle.spawn(async move {

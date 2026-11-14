@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::client::{ClientIdentity, TokenVerifier};
 
+/// Largest SCTP message this host advertises and can send (same value as the
+/// Minecraft client's `a=max-message-size`).
+pub const MAX_SCTP_MESSAGE_SIZE: usize = 262_144;
+
 /// Body of `GET /v1/join` (guide §4, "Capability Check and Server Info").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,6 +109,15 @@ pub struct NetherNetConfig {
     pub max_outgoing_message_size: usize,
     /// Maximum size of a reassembled incoming message.
     pub max_incoming_message_size: usize,
+    /// Maximum number of received bytes buffered per connection and not yet
+    /// read with [`crate::NetherNetConnection::recv`]. When the budget is
+    /// exhausted, the reliable channel applies back-pressure (the peer is slowed
+    /// down by SCTP flow control) and unreliable messages are dropped.
+    pub max_buffered_incoming_bytes: usize,
+    /// Per-channel limit of bytes handed to `send()` but not yet acknowledged by
+    /// the peer. Once reached, `send()` waits; this bounds the memory a slow or
+    /// hostile client can make the server hold.
+    pub send_buffer_limit: usize,
     /// Maximum time spent gathering ICE candidates before answering.
     pub ice_gathering_timeout: Duration,
     /// Maximum time between the answer and the data channels being open.
@@ -126,6 +139,8 @@ impl Default for NetherNetConfig {
             include_loopback_candidates: false,
             max_outgoing_message_size: 65_536,
             max_incoming_message_size: 16 * 1024 * 1024,
+            max_buffered_incoming_bytes: 32 * 1024 * 1024,
+            send_buffer_limit: 4 * 1024 * 1024,
             ice_gathering_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(30),
             max_pending_connections: 64,
@@ -147,6 +162,11 @@ impl fmt::Debug for NetherNetConfig {
             )
             .field("max_outgoing_message_size", &self.max_outgoing_message_size)
             .field("max_incoming_message_size", &self.max_incoming_message_size)
+            .field(
+                "max_buffered_incoming_bytes",
+                &self.max_buffered_incoming_bytes,
+            )
+            .field("send_buffer_limit", &self.send_buffer_limit)
             .field("ice_gathering_timeout", &self.ice_gathering_timeout)
             .field("connect_timeout", &self.connect_timeout)
             .field("max_pending_connections", &self.max_pending_connections)
@@ -161,9 +181,29 @@ impl NetherNetConfig {
         if self.udp_bind_addrs.is_empty() {
             return Err(Config("udp_bind_addrs must not be empty".into()));
         }
-        if self.max_outgoing_message_size < 2 {
+        if !(2..=MAX_SCTP_MESSAGE_SIZE).contains(&self.max_outgoing_message_size) {
+            return Err(Config(format!(
+                "max_outgoing_message_size must be within 2..={MAX_SCTP_MESSAGE_SIZE}"
+            )));
+        }
+        if self.max_incoming_message_size == 0 {
+            return Err(Config("max_incoming_message_size must be non-zero".into()));
+        }
+        // The budget is enforced with a semaphore whose permits are counted in u32.
+        let budget_max = (u32::MAX as usize).min(tokio::sync::Semaphore::MAX_PERMITS);
+        if self.max_buffered_incoming_bytes == 0 || self.max_buffered_incoming_bytes > budget_max {
+            return Err(Config(format!(
+                "max_buffered_incoming_bytes must be within 1..={budget_max}"
+            )));
+        }
+        if self.send_buffer_limit == 0 {
             return Err(Config(
-                "max_outgoing_message_size must be at least 2".into(),
+                "send_buffer_limit must be non-zero (use usize::MAX for unbounded)".into(),
+            ));
+        }
+        if self.ice_gathering_timeout.is_zero() || self.connect_timeout.is_zero() {
+            return Err(Config(
+                "ice_gathering_timeout and connect_timeout must be non-zero".into(),
             ));
         }
         if self.max_pending_connections == 0 || self.accept_backlog == 0 {
@@ -204,5 +244,34 @@ mod tests {
     #[test]
     fn default_config_is_valid() {
         NetherNetConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn invalid_configs_are_rejected() {
+        let bad = [
+            NetherNetConfig {
+                max_outgoing_message_size: MAX_SCTP_MESSAGE_SIZE + 1,
+                ..Default::default()
+            },
+            NetherNetConfig {
+                max_incoming_message_size: 0,
+                ..Default::default()
+            },
+            NetherNetConfig {
+                max_buffered_incoming_bytes: 0,
+                ..Default::default()
+            },
+            NetherNetConfig {
+                send_buffer_limit: 0,
+                ..Default::default()
+            },
+            NetherNetConfig {
+                connect_timeout: Duration::ZERO,
+                ..Default::default()
+            },
+        ];
+        for config in bad {
+            assert!(config.validate().is_err(), "{config:?}");
+        }
     }
 }

@@ -364,3 +364,85 @@ async fn rejected_offers() {
 
     client.pc.close().await.unwrap();
 }
+
+async fn wait_closed(dc: &Arc<dyn DataChannel>) {
+    loop {
+        match dc.poll().await {
+            Some(DataChannelEvent::OnClose) | None => return,
+            Some(_) => continue,
+        }
+    }
+}
+
+/// A hostile client opening extra / malformed data channels must not be able
+/// to replace the legitimate ones (audit fix: duplicate channels were accepted).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extra_data_channels_are_rejected() {
+    let auth_service = SigningKey::generate();
+    let (listener, url) = start_server(&auth_service).await;
+    let client = fake_client().await;
+    let offer = sign_offer(&client.offer, &auth_service, &SigningKey::generate());
+    let answer = reqwest::Client::new()
+        .post(format!("{url}/v1/join/777"))
+        .body(offer)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    client
+        .pc
+        .set_remote_description(
+            RTCSessionDescription::answer(sdp::strip_identity(&answer)).unwrap(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(TIMEOUT, wait_open(&client.reliable))
+        .await
+        .unwrap();
+    let conn = tokio::time::timeout(TIMEOUT, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Duplicate label, unordered "reliable" channel and unknown label: all closed.
+    let duplicate = client
+        .pc
+        .create_data_channel("UnreliableDataChannel", None)
+        .await
+        .unwrap();
+    let unordered = client
+        .pc
+        .create_data_channel(
+            "ReliableDataChannel",
+            Some(RTCDataChannelInit {
+                ordered: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let unknown = client
+        .pc
+        .create_data_channel("Whatever", None)
+        .await
+        .unwrap();
+    for dc in [&duplicate, &unordered, &unknown] {
+        tokio::time::timeout(TIMEOUT, wait_closed(dc))
+            .await
+            .expect("server closed the extra channel");
+    }
+
+    // The original channels still work.
+    for frame in framing::fragment(b"still here", 1200).unwrap() {
+        client.reliable.send(BytesMut::from(frame)).await.unwrap();
+    }
+    let msg = tokio::time::timeout(TIMEOUT, conn.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&msg.payload[..], b"still here");
+    assert!(!conn.is_closed());
+    client.pc.close().await.unwrap();
+}

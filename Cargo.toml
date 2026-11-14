@@ -13,7 +13,7 @@ categories = ["network-programming", "game-development"]
 
 [dependencies]
 # Async runtime & HTTP signaling
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "sync", "time"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "tokio", "json"] }
 async-trait = "0.1"
 
@@ -36,5 +36,6 @@ thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.13", default-features = false }

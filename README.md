@@ -133,6 +133,8 @@ Champs de `NetherNetConfig` :
 | `include_loopback_candidates` | `false` | Annonce aussi `127.0.0.1` (utile pour les tests locaux). |
 | `max_outgoing_message_size` | 65 536 | Taille maximale d'un message SCTP envoyé, en-tête compris. |
 | `max_incoming_message_size` | 16 Mio | Taille maximale d'un message reçu, une fois réassemblé. |
+| `max_buffered_incoming_bytes` | 32 Mio | Octets reçus en attente de `recv()` par connexion. Au-delà, le canal fiable ralentit le client et les messages non fiables sont ignorés. |
+| `send_buffer_limit` | 4 Mio | Octets envoyés mais pas encore acquittés, par canal. Au-delà, `send()` attend. |
 | `ice_gathering_timeout` | 5 s | Temps maximal de collecte des candidats ICE avant de répondre. |
 | `connect_timeout` | 30 s | Temps maximal entre la réponse et l'ouverture des canaux. |
 | `max_pending_connections` | 64 | Connexions en cours de négociation ; au-delà, HTTP 503. |

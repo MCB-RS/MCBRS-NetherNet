@@ -238,6 +238,13 @@ impl Jwt {
         if !claims.is_object() {
             return Err(Error::identity("JWT claims must be a JSON object"));
         }
+        // RFC 7515 §4.1.11: unknown critical extensions must be rejected, and we
+        // implement none.
+        if header.get("crit").is_some() {
+            return Err(Error::identity(
+                "JWT uses unsupported critical header parameters",
+            ));
+        }
         Ok(Self {
             header,
             claims,
@@ -261,15 +268,33 @@ impl Jwt {
         key.verify(self.alg(), self.signing_input.as_bytes(), &self.signature)
     }
 
+    /// Reads a NumericDate claim (RFC 7519 §2): seconds since the epoch,
+    /// integer or decimal. A claim that is present but malformed is an error,
+    /// never silently ignored.
+    pub fn numeric_date(&self, name: &str) -> Result<Option<u64>> {
+        let Some(value) = self.claims.get(name) else {
+            return Ok(None);
+        };
+        if let Some(n) = value.as_u64() {
+            return Ok(Some(n));
+        }
+        match value.as_f64() {
+            // Truncation of the fractional part is intended (second precision).
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            Some(f) if f.is_finite() && f >= 0.0 => Ok(Some(f as u64)),
+            _ => Err(Error::identity(format!("malformed `{name}` claim"))),
+        }
+    }
+
     /// Checks `exp` / `nbf` against the current time, with some leeway (seconds).
     pub fn validate_time(&self, leeway: u64) -> Result<()> {
         let now = unix_now();
-        if let Some(exp) = self.claims.get("exp").and_then(Value::as_u64)
+        if let Some(exp) = self.numeric_date("exp")?
             && now > exp.saturating_add(leeway)
         {
             return Err(Error::identity("token is expired"));
         }
-        if let Some(nbf) = self.claims.get("nbf").and_then(Value::as_u64)
+        if let Some(nbf) = self.numeric_date("nbf")?
             && now.saturating_add(leeway) < nbf
         {
             return Err(Error::identity("token is not valid yet"));
@@ -363,6 +388,43 @@ mod tests {
         let key = SigningKey::generate();
         let token = sign_jwt(&key, &serde_json::json!({ "exp": 10 }));
         assert!(Jwt::parse(&token).unwrap().validate_time(60).is_err());
+    }
+
+    #[test]
+    fn malformed_or_decimal_dates() {
+        let key = SigningKey::generate();
+        let parse = |claims: Value| Jwt::parse(&sign_jwt(&key, &claims)).unwrap();
+        // A decimal `exp` in the past used to be ignored (as_u64 -> None).
+        assert!(
+            parse(serde_json::json!({ "exp": 10.5 }))
+                .validate_time(0)
+                .is_err()
+        );
+        let future = unix_now() as f64 + 3600.5;
+        assert!(
+            parse(serde_json::json!({ "exp": future }))
+                .validate_time(0)
+                .is_ok()
+        );
+        assert!(
+            parse(serde_json::json!({ "exp": "soon" }))
+                .validate_time(0)
+                .is_err()
+        );
+        assert!(
+            parse(serde_json::json!({ "nbf": -1 }))
+                .validate_time(0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn crit_header_is_rejected() {
+        let key = SigningKey::generate();
+        let header = b64url(r#"{"alg":"ES384","crit":["exp"]}"#);
+        let input = format!("{header}.{}", b64url("{}"));
+        let token = format!("{input}.{}", b64url(key.sign(input.as_bytes())));
+        assert!(Jwt::parse(&token).is_err());
     }
 
     #[test]

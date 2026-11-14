@@ -18,20 +18,33 @@ pub trait TokenVerifier: Send + Sync + 'static {
 }
 
 /// Verifies tokens against a static set of JWKs (a JWKS document).
-#[derive(Debug, Clone, Default)]
+///
+/// By default tokens must carry an `exp` claim (a token without expiry could
+/// be replayed forever) and a 60 s clock skew is tolerated.
+#[derive(Debug, Clone)]
 pub struct JwkSetVerifier {
     keys: Vec<(Option<String>, VerifyingKey)>,
     issuer: Option<String>,
     audience: Option<String>,
     leeway_secs: u64,
+    require_exp: bool,
+}
+
+impl Default for JwkSetVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JwkSetVerifier {
     /// Creates a verifier with no key (add some with [`Self::with_key`]).
     pub fn new() -> Self {
         Self {
+            keys: Vec::new(),
+            issuer: None,
+            audience: None,
             leeway_secs: 60,
-            ..Self::default()
+            require_exp: true,
         }
     }
 
@@ -82,6 +95,12 @@ impl JwkSetVerifier {
         self.leeway_secs = leeway;
         self
     }
+
+    /// Whether tokens without an `exp` claim are rejected (default `true`).
+    pub fn with_require_exp(mut self, require: bool) -> Self {
+        self.require_exp = require;
+        self
+    }
 }
 
 impl TokenVerifier for JwkSetVerifier {
@@ -107,6 +126,9 @@ impl TokenVerifier for JwkSetVerifier {
             return Err(Error::identity(
                 "GameServerToken signature does not match any trusted auth service key",
             ));
+        }
+        if self.require_exp && jwt.numeric_date("exp")?.is_none() {
+            return Err(Error::identity("GameServerToken has no `exp` claim"));
         }
         jwt.validate_time(self.leeway_secs)?;
 
@@ -288,6 +310,18 @@ m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
         let offer = signed_offer(&auth, &client).replace("AA:BB:CC", "DE:AD:00");
         let verifier = JwkSetVerifier::new().with_key(None, auth.verifying_key());
         assert!(verify_client_offer(&offer, &verifier).is_err());
+    }
+
+    #[test]
+    fn token_without_exp_is_rejected_by_default() {
+        let auth = SigningKey::generate();
+        let token = jose::sign_jwt(&auth, &serde_json::json!({ "xid": "1" }));
+        let strict = JwkSetVerifier::new().with_key(None, auth.verifying_key());
+        assert!(strict.verify(&token).is_err());
+        let lenient = strict.with_require_exp(false);
+        assert!(lenient.verify(&token).is_ok());
+        assert!(JwkSetVerifier::default().require_exp);
+        assert_eq!(JwkSetVerifier::default().leeway_secs, 60);
     }
 
     #[test]

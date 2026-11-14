@@ -2,7 +2,7 @@
 //! all-in-one [`NetherNetListener`] (HTTP signaling + host).
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 
 use rtc::ice::network_type::NetworkType;
 use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
@@ -15,20 +15,31 @@ use webrtc::peer_connection::{
     RTCSessionDescription, SettingEngineBuilder,
 };
 
-use crate::config::{ClientAuth, JoinRequest, NetherNetConfig, ServerInfo};
-use crate::conn::{NetherNetConnection, Shared, pump_data_channel};
+use crate::config::{ClientAuth, JoinRequest, MAX_SCTP_MESSAGE_SIZE, NetherNetConfig, ServerInfo};
+use crate::conn::{ConnReceiver, NetherNetConnection, Shared, pump_data_channel};
 use crate::error::{Error, Result};
 use crate::identity::client::{ClientIdentity, verify_client_offer};
 use crate::identity::server::ServerIdentity;
 use crate::sdp;
 use crate::signaling::{self, OfferRequest, SignalingError, SignalingHandler};
 
-/// SCTP max message size advertised to clients (same as the Minecraft client).
-const LOCAL_SCTP_MAX_MESSAGE_SIZE: u32 = 262_144;
-/// Per-connection buffer of received messages not yet read by the application.
-const MESSAGE_BUFFER: usize = 1024;
+/// Per-connection queue length of received messages not yet read by the
+/// application (the byte budget is `max_buffered_incoming_bytes`).
+const MESSAGE_QUEUE_LEN: usize = 1024;
 /// Upper bound for a NetworkID (it is opaque, but must stay reasonable).
 const MAX_NETWORK_ID_LEN: usize = 256;
+
+/// Validates the opaque NetworkID: bounded length and no control characters
+/// (it ends up in logs, where `\n` or ANSI escapes would allow log injection).
+fn validate_network_id(network_id: &str) -> Result<(), SignalingError> {
+    if network_id.is_empty()
+        || network_id.len() > MAX_NETWORK_ID_LEN
+        || network_id.chars().any(char::is_control)
+    {
+        return Err(SignalingError::BadRequest("invalid NetworkID".into()));
+    }
+    Ok(())
+}
 
 /// Receives connections established by a [`NetherNetHost`].
 #[derive(Debug)]
@@ -92,17 +103,33 @@ impl NetherNetHost {
 
     /// Current server metadata (served on `GET /v1/join`).
     pub fn server_info(&self) -> ServerInfo {
-        self.inner.server_info.read().expect("poisoned").clone()
+        // A panic inside `update_server_info` must not take `GET /v1/join` down
+        // forever: recover the data from a poisoned lock.
+        self.inner
+            .server_info
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Replaces the server metadata.
     pub fn set_server_info(&self, info: ServerInfo) {
-        *self.inner.server_info.write().expect("poisoned") = info;
+        *self
+            .inner
+            .server_info
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = info;
     }
 
     /// Updates the server metadata in place (e.g. the player count).
     pub fn update_server_info(&self, update: impl FnOnce(&mut ServerInfo)) {
-        update(&mut self.inner.server_info.write().expect("poisoned"));
+        update(
+            &mut self
+                .inner
+                .server_info
+                .write()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
     }
 
     /// The operator identity used to sign answers.
@@ -114,7 +141,14 @@ impl NetherNetHost {
     /// the signed answer. The connection is delivered to [`Incoming`] later,
     /// once its data channels are open.
     pub async fn accept_offer(&self, request: OfferRequest) -> Result<String, SignalingError> {
-        self.inner.clone().accept_offer(request).await
+        // Run the negotiation in its own task: if the HTTP client hangs up, the
+        // request future is dropped, and a PeerConnection created by a dropped
+        // future would never be closed (its driver task and UDP sockets leak).
+        // A detached task always reaches the code paths that close it.
+        match tokio::spawn(self.inner.clone().accept_offer(request)).await {
+            Ok(result) => result,
+            Err(e) => Err(SignalingError::Internal(format!("offer task failed: {e}"))),
+        }
     }
 }
 
@@ -140,9 +174,7 @@ impl HostInner {
             signaling_addr,
         } = request;
 
-        if network_id.is_empty() || network_id.len() > MAX_NETWORK_ID_LEN {
-            return Err(SignalingError::BadRequest("invalid NetworkID".into()));
-        }
+        validate_network_id(&network_id)?;
         sdp::validate_offer(&offer).map_err(SignalingError::BadRequest)?;
 
         // §5.1 – validate the client assertion before allocating anything.
@@ -174,7 +206,8 @@ impl HostInner {
         let (shared, msg_rx) = Shared::new(
             network_id.clone(),
             self.config.max_incoming_message_size,
-            MESSAGE_BUFFER,
+            self.config.max_buffered_incoming_bytes,
+            MESSAGE_QUEUE_LEN,
         );
         let (pc, answer) = self.negotiate(shared.clone(), offer).await.map_err(|e| {
             shared.close();
@@ -232,7 +265,9 @@ impl HostInner {
         let mut settings = SettingEngineBuilder::new()
             .with_network_types(vec![NetworkType::Udp4, NetworkType::Udp6])
             .with_include_loopback_candidate(self.config.include_loopback_candidates)
-            .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(LOCAL_SCTP_MAX_MESSAGE_SIZE));
+            .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(
+                u32::try_from(MAX_SCTP_MESSAGE_SIZE).unwrap_or(u32::MAX),
+            ));
         if !self.config.public_ips.is_empty() {
             settings = settings.with_nat_1to1_ips(
                 self.config
@@ -257,6 +292,7 @@ impl HostInner {
             .with_setting_engine(settings.build())
             .with_handler(handler)
             .with_udp_addrs(self.config.udp_bind_addrs.clone())
+            .with_data_channel_send_buffer_limit(self.config.send_buffer_limit)
             .build()
             .await?;
         let pc: Arc<dyn PeerConnection> = Arc::new(pc);
@@ -331,7 +367,7 @@ impl HostInner {
 struct PendingConnection {
     shared: Arc<Shared>,
     pc: Arc<dyn PeerConnection>,
-    msg_rx: mpsc::Receiver<crate::conn::Message>,
+    msg_rx: ConnReceiver,
     max_message_size: usize,
     identity: Option<ClientIdentity>,
     signaling_addr: Option<SocketAddr>,
@@ -447,7 +483,7 @@ impl NetherNetListener {
         let mut stop = self.shutdown.subscribe();
         tokio::select! {
             conn = incoming.accept() => conn,
-            _ = stop.wait_for(|s| *s) => None,
+            _ = stop.wait_for(|stopped| *stopped) => None,
         }
     }
 
@@ -461,5 +497,20 @@ impl NetherNetListener {
 impl Drop for NetherNetListener {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_id_validation() {
+        assert!(validate_network_id("9876543210123456789").is_ok());
+        assert!(validate_network_id("a1b2c3d4-guid-like").is_ok());
+        assert!(validate_network_id("").is_err());
+        assert!(validate_network_id(&"1".repeat(MAX_NETWORK_ID_LEN + 1)).is_err());
+        assert!(validate_network_id("123\nINFO forged log line").is_err());
+        assert!(validate_network_id("123\u{1b}[31m").is_err());
     }
 }

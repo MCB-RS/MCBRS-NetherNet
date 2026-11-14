@@ -10,6 +10,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -24,6 +25,9 @@ use crate::error::Error;
 
 /// Maximum accepted SDP offer size.
 pub const MAX_OFFER_SIZE: usize = 256 * 1024;
+
+/// Maximum time allowed to receive the offer body (slowloris protection).
+pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An SDP offer received on `POST /v1/join/{networkId}`.
 #[derive(Debug, Clone)]
@@ -45,6 +49,9 @@ pub enum SignalingError {
     /// 403 – the player is not allowed to join.
     #[error("forbidden: {0}")]
     Forbidden(String),
+    /// 408 – the client did not send its request in time.
+    #[error("request timeout: {0}")]
+    RequestTimeout(String),
     /// 503 – the server is overloaded or shutting down.
     #[error("service unavailable: {0}")]
     Unavailable(String),
@@ -59,6 +66,7 @@ impl SignalingError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
+            Self::RequestTimeout(_) => StatusCode::REQUEST_TIMEOUT,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -71,6 +79,7 @@ impl From<Error> for SignalingError {
             Error::Sdp(_) | Error::Framing(_) | Error::Json(_) => Self::BadRequest(e.to_string()),
             Error::Identity(_) | Error::Unauthorized(_) => Self::Forbidden(e.to_string()),
             Error::Timeout(_) | Error::Closed => Self::Unavailable(e.to_string()),
+            Error::MessageTooLarge { .. } => Self::BadRequest(e.to_string()),
             _ => Self::Internal(e.to_string()),
         }
     }
@@ -133,17 +142,23 @@ async fn post_join(
         tracing::debug!(?ct, "offer with unexpected content-type, accepting anyway");
     }
 
-    let body = match axum::body::to_bytes(request.into_body(), MAX_OFFER_SIZE).await {
-        Ok(b) => b,
-        Err(_) => {
-            return error_response(SignalingError::BadRequest(
+    let read = axum::body::to_bytes(request.into_body(), MAX_OFFER_SIZE);
+    let body = match tokio::time::timeout(BODY_READ_TIMEOUT, read).await {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return error_response(&SignalingError::BadRequest(
                 "body too large or unreadable".into(),
             ));
         }
+        Err(_) => {
+            return error_response(&SignalingError::RequestTimeout(
+                "offer body not received in time".into(),
+            ));
+        }
     };
-    let sdp = match String::from_utf8(body.to_vec()) {
-        Ok(s) => s,
-        Err(_) => return error_response(SignalingError::BadRequest("SDP is not UTF-8".into())),
+    // `Vec::from(Bytes)` reuses the buffer when it is uniquely owned.
+    let Ok(sdp) = String::from_utf8(Vec::from(body)) else {
+        return error_response(&SignalingError::BadRequest("SDP is not UTF-8".into()));
     };
 
     let request = OfferRequest {
@@ -164,12 +179,21 @@ async fn post_join(
             response
         }
         Err(e) => {
-            tracing::info!(%network_id, ?signaling_addr, "join refused: {e}");
-            error_response(e)
+            tracing::info!(
+                network_id = %network_id.escape_debug(),
+                ?signaling_addr,
+                "join refused: {e}"
+            );
+            error_response(&e)
         }
     }
 }
 
-fn error_response(error: SignalingError) -> Response {
-    (error.status(), error.to_string()).into_response()
+fn error_response(error: &SignalingError) -> Response {
+    let body = match error {
+        // Internal details (WebRTC / I/O errors) are logged, not sent to clients.
+        SignalingError::Internal(_) => "internal error".to_owned(),
+        other => other.to_string(),
+    };
+    (error.status(), body).into_response()
 }

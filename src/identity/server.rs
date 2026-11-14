@@ -61,8 +61,15 @@ impl ServerIdentity {
                 if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     std::fs::create_dir_all(parent)?;
                 }
-                write_private(path, identity.to_pkcs8_pem()?.as_bytes())?;
-                Ok(identity)
+                match write_private(path, identity.to_pkcs8_pem()?.as_bytes()) {
+                    Ok(()) => Ok(identity),
+                    // Another process created the key in the meantime: use theirs,
+                    // so that every process signs with the same operator key.
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Self::from_pkcs8_pem(&std::fs::read_to_string(path)?)
+                    }
+                    Err(e) => Err(Error::Io(e)),
+                }
             }
             Err(e) => Err(Error::Io(e)),
         }
@@ -108,7 +115,7 @@ impl ServerIdentity {
         let mut claims = serde_json::json!({
             "cpk": self.public_key().to_jwk(),
             "iat": now,
-            "exp": now + self.token_lifetime.as_secs(),
+            "exp": now.saturating_add(self.token_lifetime.as_secs()),
         });
         if let Some(iss) = &self.issuer {
             claims["iss"] = iss.clone().into();
@@ -194,21 +201,23 @@ m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=setup:active\r\n";
 
     #[test]
     fn expired_token_fails() {
-        let id = ServerIdentity::generate().with_token_lifetime(Duration::ZERO);
+        let id = ServerIdentity::generate();
         let signed = id.sign_answer(ANSWER).unwrap();
-        // exp == iat == now: still valid this very second, but a token issued in the
-        // past with a zero lifetime must be rejected.
-        let mut claims: serde_json::Value = serde_json::json!({
-            "cpk": id.public_key().to_jwk(), "iat": 1, "exp": 2
-        });
-        claims["iss"] = "x".into();
-        let token = jose::sign_jwt(&id.key, &claims);
-        let mut a = crate::identity::IdentityAssertion::from_sdp(&signed)
+        // Swap in a correctly self-signed token that expired long ago.
+        let claims = serde_json::json!({ "cpk": id.public_key().to_jwk(), "iat": 1, "exp": 2 });
+        let mut assertion = crate::identity::IdentityAssertion::from_sdp(&signed)
             .unwrap()
             .unwrap();
-        a.token = token;
-        let resigned = sdp::insert_identity(&signed, &a.encode());
+        assertion.token = jose::sign_jwt(&id.key, &claims);
+        let resigned = sdp::insert_identity(&signed, &assertion.encode());
         assert!(verify_server_answer(&resigned).is_err());
+    }
+
+    #[test]
+    fn huge_token_lifetime_does_not_overflow() {
+        let id = ServerIdentity::generate().with_token_lifetime(Duration::MAX);
+        let token = jose::Jwt::parse(&id.issue_token()).unwrap();
+        assert_eq!(token.claims["exp"], u64::MAX);
     }
 
     #[test]

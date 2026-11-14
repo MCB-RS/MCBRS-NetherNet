@@ -8,7 +8,7 @@
 //! Fragmentation is only allowed on the `ReliableDataChannel`. On the
 //! `UnreliableDataChannel` the header is always `0`.
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::error::{Error, Result};
 
@@ -21,7 +21,9 @@ pub const MAX_FRAGMENTS: usize = u8::MAX as usize + 1;
 
 /// Largest payload that can be sent with a given SCTP max message size.
 pub fn max_payload_len(max_message_size: usize) -> usize {
-    max_message_size.saturating_sub(HEADER_LEN) * MAX_FRAGMENTS
+    max_message_size
+        .saturating_sub(HEADER_LEN)
+        .saturating_mul(MAX_FRAGMENTS)
 }
 
 /// Splits `payload` into NetherNet fragments that each fit in `max_message_size`
@@ -29,6 +31,15 @@ pub fn max_payload_len(max_message_size: usize) -> usize {
 ///
 /// A payload that fits in one SCTP message produces a single `[0x00, payload..]` frame.
 pub fn fragment(payload: &[u8], max_message_size: usize) -> Result<Vec<Bytes>> {
+    Ok(fragment_mut(payload, max_message_size)?
+        .into_iter()
+        .map(BytesMut::freeze)
+        .collect())
+}
+
+/// Same as [`fragment`], but returns mutable buffers so they can be handed to
+/// the WebRTC stack (which takes `BytesMut`) without any conversion.
+pub(crate) fn fragment_mut(payload: &[u8], max_message_size: usize) -> Result<Vec<BytesMut>> {
     if max_message_size <= HEADER_LEN {
         return Err(Error::Config(format!(
             "max message size must be greater than {HEADER_LEN} byte(s), got {max_message_size}"
@@ -45,15 +56,18 @@ pub fn fragment(payload: &[u8], max_message_size: usize) -> Result<Vec<Bytes>> {
 
     let mut frames = Vec::with_capacity(count);
     if payload.is_empty() {
-        frames.push(Bytes::from_static(&[0]));
+        frames.push(BytesMut::from(&[0u8][..]));
         return Ok(frames);
     }
     for (index, chunk) in payload.chunks(chunk_len).enumerate() {
+        // `count <= MAX_FRAGMENTS` (checked above), so the countdown fits in a u8.
+        debug_assert!(count - 1 - index <= u8::MAX as usize);
+        #[allow(clippy::cast_possible_truncation)]
         let remaining = (count - 1 - index) as u8;
         let mut frame = BytesMut::with_capacity(HEADER_LEN + chunk.len());
         frame.put_u8(remaining);
         frame.put_slice(chunk);
-        frames.push(frame.freeze());
+        frames.push(frame);
     }
     Ok(frames)
 }
@@ -61,6 +75,11 @@ pub fn fragment(payload: &[u8], max_message_size: usize) -> Result<Vec<Bytes>> {
 /// Builds a single unfragmented frame (`[0x00, payload..]`). Used on the
 /// unreliable channel, where messages that do not fit are dropped by the sender.
 pub fn frame_single(payload: &[u8], max_message_size: usize) -> Result<Bytes> {
+    frame_single_mut(payload, max_message_size).map(BytesMut::freeze)
+}
+
+/// Same as [`frame_single`], returning a mutable buffer.
+pub(crate) fn frame_single_mut(payload: &[u8], max_message_size: usize) -> Result<BytesMut> {
     let size = payload.len() + HEADER_LEN;
     if size > max_message_size {
         return Err(Error::MessageTooLarge {
@@ -71,7 +90,7 @@ pub fn frame_single(payload: &[u8], max_message_size: usize) -> Result<Bytes> {
     let mut frame = BytesMut::with_capacity(size);
     frame.put_u8(0);
     frame.put_slice(payload);
-    Ok(frame.freeze())
+    Ok(frame)
 }
 
 /// Parses a frame received on the unreliable channel, returning its payload.
@@ -86,6 +105,14 @@ pub fn parse_single(frame: &[u8]) -> Result<&[u8]> {
             "fragmented message (header {header}) on a channel that does not support fragmentation"
         ))),
     }
+}
+
+/// Owned variant of [`parse_single`]: strips the header in place, without
+/// copying the payload.
+pub fn parse_single_owned(mut frame: BytesMut) -> Result<Bytes> {
+    parse_single(&frame)?;
+    frame.advance(HEADER_LEN);
+    Ok(frame.freeze())
 }
 
 /// Reassembles fragmented messages received on the reliable channel.
@@ -113,9 +140,9 @@ impl Reassembler {
         self.expected.is_some()
     }
 
-    /// Discards any partially received message.
+    /// Discards any partially received message and releases its memory.
     pub fn reset(&mut self) {
-        self.buffer.clear();
+        self.buffer = BytesMut::new();
         self.expected = None;
     }
 
@@ -125,11 +152,30 @@ impl Reassembler {
     /// protocol violation (the reliable channel is ordered, so a broken countdown
     /// can only come from a misbehaving peer).
     pub fn push(&mut self, frame: &[u8]) -> Result<Option<Bytes>> {
+        let (header, data) = self.check(frame)?;
+        if header == 0 && self.expected.is_none() {
+            return Ok(Some(Bytes::copy_from_slice(data)));
+        }
+        Ok(self.append(header, data))
+    }
+
+    /// Same as [`Self::push`], but takes ownership of the frame so that
+    /// unfragmented messages (the common case) are returned without any copy.
+    pub fn push_owned(&mut self, mut frame: BytesMut) -> Result<Option<Bytes>> {
+        let (header, _) = self.check(&frame)?;
+        if header == 0 && self.expected.is_none() {
+            frame.advance(HEADER_LEN);
+            return Ok(Some(frame.freeze()));
+        }
+        Ok(self.append(header, &frame[HEADER_LEN..]))
+    }
+
+    /// Validates the header countdown and the size limit; resets the state on error.
+    fn check<'a>(&mut self, frame: &'a [u8]) -> Result<(u8, &'a [u8])> {
         let Some((&header, data)) = frame.split_first() else {
             self.reset();
             return Err(Error::Framing("empty message (missing header byte)".into()));
         };
-
         if let Some(expected) = self.expected
             && header != expected
         {
@@ -138,8 +184,7 @@ impl Reassembler {
                 "unexpected fragment header {header}, expected {expected}"
             )));
         }
-
-        let new_len = self.buffer.len() + data.len();
+        let new_len = self.buffer.len().saturating_add(data.len());
         if new_len > self.max_message_len {
             self.reset();
             return Err(Error::MessageTooLarge {
@@ -147,19 +192,18 @@ impl Reassembler {
                 limit: self.max_message_len,
             });
         }
+        Ok((header, data))
+    }
 
-        if header == 0 && self.expected.is_none() {
-            // Fast path: unfragmented message, no copy into the buffer.
-            return Ok(Some(Bytes::copy_from_slice(data)));
-        }
-
+    /// Appends a validated fragment; returns the message once the last one arrived.
+    fn append(&mut self, header: u8, data: &[u8]) -> Option<Bytes> {
         self.buffer.extend_from_slice(data);
         if header == 0 {
             self.expected = None;
-            Ok(Some(self.buffer.split().freeze()))
+            Some(self.buffer.split().freeze())
         } else {
             self.expected = Some(header - 1);
-            Ok(None)
+            None
         }
     }
 }
@@ -267,6 +311,30 @@ mod tests {
     }
 
     #[test]
+    fn owned_push_matches_borrowed_push() {
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i % 256) as u8).collect();
+        let mut a = Reassembler::new(1 << 20);
+        let mut b = Reassembler::new(1 << 20);
+        let (mut out_a, mut out_b) = (None, None);
+        for frame in fragment_mut(&payload, 700).unwrap() {
+            out_a = a.push(&frame).unwrap();
+            out_b = b.push_owned(frame).unwrap();
+        }
+        assert_eq!(out_a.as_deref(), Some(&payload[..]));
+        assert_eq!(out_b.as_deref(), Some(&payload[..]));
+        // Unfragmented + owned: the header is stripped in place.
+        let msg = b.push_owned(BytesMut::from(&b"\x00abc"[..])).unwrap();
+        assert_eq!(msg.as_deref(), Some(&b"abc"[..]));
+        assert!(b.push_owned(BytesMut::new()).is_err());
+    }
+
+    #[test]
+    fn max_payload_len_saturates() {
+        assert_eq!(max_payload_len(usize::MAX), usize::MAX);
+        assert_eq!(max_payload_len(0), 0);
+    }
+
+    #[test]
     fn unreliable_frames() {
         assert_eq!(
             frame_single(b"mv", 10).unwrap(),
@@ -275,5 +343,10 @@ mod tests {
         assert!(frame_single(&[0u8; 10], 10).is_err());
         assert_eq!(parse_single(b"\x00mv").unwrap(), b"mv");
         assert!(parse_single(b"\x01mv").is_err());
+        assert_eq!(
+            parse_single_owned(BytesMut::from(&b"\x00mv"[..])).unwrap(),
+            Bytes::from_static(b"mv")
+        );
+        assert!(parse_single_owned(BytesMut::from(&b"\x02mv"[..])).is_err());
     }
 }
