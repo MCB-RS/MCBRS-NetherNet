@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::sdp;
-use jose::{Jwt, VerifyingKey};
+use jose::{Jwt, SigningKey, VerifyingKey};
 
 /// The only `idp.protocol` value defined by NetherNet.
 pub const IDP_PROTOCOL: &str = "default";
@@ -94,6 +94,34 @@ impl IdentityAssertion {
     pub fn from_sdp(sdp: &str) -> Result<Option<Self>> {
         sdp::identity(sdp).map(Self::decode).transpose()
     }
+}
+
+/// Builds an assertion for `sdp_text`: `token` plus a detached JWS, made with
+/// `key`, over the canonical JSON of the SDP's `a=fingerprint` lines (§5.1 for
+/// clients, §5.2 for servers). `key` must match the token's `cpk` claim.
+pub fn sign_assertion(
+    sdp_text: &str,
+    domain: &str,
+    token: String,
+    key: &SigningKey,
+) -> Result<IdentityAssertion> {
+    let fingerprints = sdp::fingerprints(sdp_text);
+    if fingerprints.is_empty() {
+        return Err(Error::sdp("SDP has no a=fingerprint line to sign"));
+    }
+    let payload = canonical::fingerprint_payload(&fingerprints);
+    Ok(IdentityAssertion {
+        domain: domain.to_owned(),
+        protocol: IDP_PROTOCOL.into(),
+        token,
+        fingerprints: jose::sign_detached(key, payload.as_bytes()),
+    })
+}
+
+/// Returns `sdp_text` with an `a=identity` attribute signed by `key`.
+pub fn sign_sdp(sdp_text: &str, domain: &str, token: String, key: &SigningKey) -> Result<String> {
+    let assertion = sign_assertion(sdp_text, domain, token, key)?;
+    Ok(sdp::insert_identity(sdp_text, &assertion.encode()))
 }
 
 /// Checks that `jws` is a valid detached signature, by `key`, over the

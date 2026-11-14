@@ -1,46 +1,25 @@
 //! The WebRTC answering side ("Partner Host", guide §3 and §7) and the
 //! all-in-one [`NetherNetListener`] (HTTP signaling + host).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use rtc::ice::network_type::NetworkType;
-use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
 use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch};
-use webrtc::data_channel::DataChannel;
-use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCBundlePolicy,
-    RTCConfigurationBuilder, RTCIceCandidateType, RTCIceGatheringState, RTCPeerConnectionState,
-    RTCSessionDescription, SettingEngineBuilder,
-};
+use webrtc::peer_connection::{PeerConnection, RTCSessionDescription};
 
-use crate::config::{ClientAuth, JoinRequest, MAX_SCTP_MESSAGE_SIZE, NetherNetConfig, ServerInfo};
-use crate::conn::{ConnReceiver, NetherNetConnection, Shared, pump_data_channel};
-use crate::error::{Error, Result};
+use crate::config::{ClientAuth, JoinRequest, NetherNetConfig, ServerInfo};
+use crate::conn::{ConnReceiver, NetherNetConnection, Shared};
+use crate::error::Result;
 use crate::identity::client::{ClientIdentity, verify_client_offer};
 use crate::identity::server::ServerIdentity;
+use crate::peer::{PeerSettings, new_peer};
 use crate::sdp;
-use crate::signaling::{self, OfferRequest, SignalingError, SignalingHandler};
+use crate::signaling::{self, OfferRequest, SignalingError, SignalingHandler, validate_network_id};
 
 /// Per-connection queue length of received messages not yet read by the
 /// application (the byte budget is `max_buffered_incoming_bytes`).
 const MESSAGE_QUEUE_LEN: usize = 1024;
-/// Upper bound for a NetworkID (it is opaque, but must stay reasonable).
-const MAX_NETWORK_ID_LEN: usize = 256;
-
-/// Validates the opaque NetworkID: bounded length and no control characters
-/// (it ends up in logs, where `\n` or ANSI escapes would allow log injection).
-fn validate_network_id(network_id: &str) -> Result<(), SignalingError> {
-    if network_id.is_empty()
-        || network_id.len() > MAX_NETWORK_ID_LEN
-        || network_id.chars().any(char::is_control)
-    {
-        return Err(SignalingError::BadRequest("invalid NetworkID".into()));
-    }
-    Ok(())
-}
-
 /// Receives connections established by a [`NetherNetHost`].
 #[derive(Debug)]
 pub struct Incoming(mpsc::Receiver<NetherNetConnection>);
@@ -161,6 +140,10 @@ impl SignalingHandler for NetherNetHost {
     async fn handle_offer(&self, request: OfferRequest) -> Result<String, SignalingError> {
         self.accept_offer(request).await
     }
+
+    fn trusted_proxies(&self) -> &[IpAddr] {
+        &self.inner.config.trusted_proxies
+    }
 }
 
 impl HostInner {
@@ -174,7 +157,7 @@ impl HostInner {
             signaling_addr,
         } = request;
 
-        validate_network_id(&network_id)?;
+        validate_network_id(&network_id).map_err(SignalingError::BadRequest)?;
         sdp::validate_offer(&offer).map_err(SignalingError::BadRequest)?;
 
         // §5.1 – validate the client assertion before allocating anything.
@@ -199,7 +182,14 @@ impl HostInner {
             .map_err(|_| SignalingError::Unavailable("too many pending connections".into()))?;
 
         // §5.1 step 7 – WebRTC stacks reject unknown attributes.
-        let offer = sdp::strip_identity(&offer);
+        let mut offer = sdp::strip_identity(&offer);
+        if self.config.infer_client_candidates
+            && let Some(addr) = signaling_addr
+            && let Some(with_inferred) = sdp::infer_client_candidates(&offer, addr.ip())
+        {
+            tracing::debug!(%network_id, ip = %addr.ip(), "added inferred client candidate");
+            offer = with_inferred;
+        }
         let remote_max = sdp::max_message_size(&offer).unwrap_or(sdp::DEFAULT_MAX_MESSAGE_SIZE);
         let max_message_size = remote_max.min(self.config.max_outgoing_message_size);
 
@@ -262,65 +252,29 @@ impl HostInner {
         shared: Arc<Shared>,
         offer: String,
     ) -> Result<(Arc<dyn PeerConnection>, String)> {
-        let mut settings = SettingEngineBuilder::new()
-            .with_network_types(vec![NetworkType::Udp4, NetworkType::Udp6])
-            .with_include_loopback_candidate(self.config.include_loopback_candidates)
-            .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(
-                u32::try_from(MAX_SCTP_MESSAGE_SIZE).unwrap_or(u32::MAX),
-            ));
-        if !self.config.public_ips.is_empty() {
-            settings = settings.with_nat_1to1_ips(
-                self.config
-                    .public_ips
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-                RTCIceCandidateType::Srflx,
-            );
-        }
-        let configuration = RTCConfigurationBuilder::new()
-            .with_bundle_policy(RTCBundlePolicy::MaxBundle)
-            .build();
-
-        let (gathered_tx, mut gathered_rx) = mpsc::channel(1);
-        let handler = Arc::new(PeerHandler {
-            shared,
-            gathered: gathered_tx,
-        });
-        let pc = PeerConnectionBuilder::new()
-            .with_configuration(configuration)
-            .with_setting_engine(settings.build())
-            .with_handler(handler)
-            .with_udp_addrs(self.config.udp_bind_addrs.clone())
-            .with_data_channel_send_buffer_limit(self.config.send_buffer_limit)
-            .build()
-            .await?;
-        let pc: Arc<dyn PeerConnection> = Arc::new(pc);
-
+        let settings = PeerSettings {
+            udp_bind_addrs: &self.config.udp_bind_addrs,
+            ice_servers: &self.config.ice_servers,
+            public_ips: &self.config.public_ips,
+            include_loopback_candidates: self.config.include_loopback_candidates,
+            send_buffer_limit: self.config.send_buffer_limit,
+        };
+        let mut peer = new_peer(&settings, shared).await?;
         let result = async {
-            pc.set_remote_description(RTCSessionDescription::offer(offer)?)
+            peer.pc
+                .set_remote_description(RTCSessionDescription::offer(offer)?)
                 .await?;
-            let answer = pc.create_answer(None).await?;
-            pc.set_local_description(answer).await?;
-            if tokio::time::timeout(self.config.ice_gathering_timeout, gathered_rx.recv())
+            let answer = peer.pc.create_answer(None).await?;
+            peer.pc.set_local_description(answer).await?;
+            peer.local_description(self.config.ice_gathering_timeout)
                 .await
-                .is_err()
-            {
-                tracing::warn!(
-                    "ICE gathering timed out, answering with the candidates found so far"
-                );
-            }
-            pc.local_description()
-                .await
-                .map(|d| d.sdp)
-                .ok_or_else(|| Error::sdp("no local description after negotiation"))
         }
         .await;
 
         match result {
-            Ok(answer) => Ok((pc, answer)),
+            Ok(answer) => Ok((peer.pc, answer)),
             Err(e) => {
-                let _ = pc.close().await;
+                let _ = peer.pc.close().await;
                 Err(e)
             }
         }
@@ -372,35 +326,6 @@ struct PendingConnection {
     identity: Option<ClientIdentity>,
     signaling_addr: Option<SocketAddr>,
     permit: OwnedSemaphorePermit,
-}
-
-struct PeerHandler {
-    shared: Arc<Shared>,
-    gathered: mpsc::Sender<()>,
-}
-
-#[async_trait::async_trait]
-impl PeerConnectionEventHandler for PeerHandler {
-    async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
-        if state == RTCIceGatheringState::Complete {
-            let _ = self.gathered.try_send(());
-        }
-    }
-
-    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        tracing::debug!(network_id = %self.shared.network_id, %state, "peer connection state");
-        if matches!(
-            state,
-            RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
-        ) {
-            self.shared.close();
-        }
-    }
-
-    async fn on_data_channel(&self, data_channel: Arc<dyn DataChannel>) {
-        // Never block the WebRTC driver: pump each channel in its own task.
-        tokio::spawn(pump_data_channel(self.shared.clone(), data_channel));
-    }
 }
 
 /// All-in-one NetherNet server: HTTP signaling endpoint + WebRTC host.
@@ -497,20 +422,5 @@ impl NetherNetListener {
 impl Drop for NetherNetListener {
     fn drop(&mut self) {
         self.shutdown();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn network_id_validation() {
-        assert!(validate_network_id("9876543210123456789").is_ok());
-        assert!(validate_network_id("a1b2c3d4-guid-like").is_ok());
-        assert!(validate_network_id("").is_err());
-        assert!(validate_network_id(&"1".repeat(MAX_NETWORK_ID_LEN + 1)).is_err());
-        assert!(validate_network_id("123\nINFO forged log line").is_err());
-        assert!(validate_network_id("123\u{1b}[31m").is_err());
     }
 }

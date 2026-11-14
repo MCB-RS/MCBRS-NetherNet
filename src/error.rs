@@ -49,6 +49,23 @@ pub enum Error {
     #[error("connection closed")]
     Closed,
 
+    /// HTTP transport error while talking to a signaling server (client side).
+    #[error("HTTP error: {0}")]
+    Http(String),
+
+    /// The signaling server refused the offer or the request (non-2xx status).
+    #[error("signaling server answered HTTP {status}: {message}")]
+    SignalingRejected {
+        /// HTTP status code.
+        status: u16,
+        /// Response body (truncated), for diagnostics.
+        message: String,
+    },
+
+    /// The server's operator key was refused by the client trust policy (§5.2).
+    #[error("untrusted server: {0}")]
+    UntrustedServer(String),
+
     /// Error coming from the WebRTC stack.
     #[error("WebRTC error: {0}")]
     WebRtc(#[from] webrtc::error::Error),
@@ -69,5 +86,11 @@ impl Error {
 
     pub(crate) fn sdp(msg: impl fmt::Display) -> Self {
         Self::Sdp(msg.to_string())
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Http(e.to_string())
     }
 }

@@ -31,6 +31,9 @@ base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Client-side signaling (HTTP + HTTPS)
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+
 # Misc
 thiserror = "2"
 tracing = "0.1"
@@ -38,4 +41,3 @@ tracing = "0.1"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.13", default-features = false }

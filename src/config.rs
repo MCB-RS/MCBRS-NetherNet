@@ -13,6 +13,79 @@ use crate::identity::client::{ClientIdentity, TokenVerifier};
 /// Minecraft client's `a=max-message-size`).
 pub const MAX_SCTP_MESSAGE_SIZE: usize = 262_144;
 
+/// A STUN or TURN server used while gathering ICE candidates (guide §2, §7).
+///
+/// The Minecraft client configures none, and the guide recommends against
+/// them for HTTP signaling: with full ICE every server must answer before the
+/// SDP can be sent, which adds latency. They are still useful on a host behind
+/// a NAT (STUN discovers its `srflx` candidate) or when a relay is required
+/// (TURN `relay` candidates).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IceServer {
+    /// URLs of the server: `stun:host[:port]`, `turn:host[:port][?transport=udp|tcp]`
+    /// or `turns:host[:port]`.
+    pub urls: Vec<String>,
+    /// TURN username (required for `turn:` / `turns:` URLs).
+    pub username: Option<String>,
+    /// TURN credential (required for `turn:` / `turns:` URLs).
+    pub credential: Option<String>,
+}
+
+impl IceServer {
+    /// A STUN server, e.g. `IceServer::stun("stun:stun.example.com:3478")`.
+    pub fn stun(url: impl Into<String>) -> Self {
+        Self {
+            urls: vec![url.into()],
+            ..Self::default()
+        }
+    }
+
+    /// A TURN server with its long-term credentials.
+    pub fn turn(
+        url: impl Into<String>,
+        username: impl Into<String>,
+        credential: impl Into<String>,
+    ) -> Self {
+        Self {
+            urls: vec![url.into()],
+            username: Some(username.into()),
+            credential: Some(credential.into()),
+        }
+    }
+
+    fn has_stun_url(&self) -> bool {
+        self.urls
+            .iter()
+            .any(|u| u.to_ascii_lowercase().starts_with("stun:"))
+    }
+
+    /// Checks the URL schemes and that TURN servers carry credentials.
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::Error::Config;
+        if self.urls.is_empty() {
+            return Err(Config("an ICE server needs at least one URL".into()));
+        }
+        for url in &self.urls {
+            let lower = url.to_ascii_lowercase();
+            let is_turn = lower.starts_with("turn:") || lower.starts_with("turns:");
+            if !is_turn && !lower.starts_with("stun:") {
+                return Err(Config(format!(
+                    "ICE server URL `{url}` must start with stun:, turn: or turns:"
+                )));
+            }
+            if lower.contains('\n') || lower.contains('\r') {
+                return Err(Config("ICE server URL contains a line break".into()));
+            }
+            if is_turn && (self.username.is_none() || self.credential.is_none()) {
+                return Err(Config(format!(
+                    "TURN server `{url}` requires a username and a credential"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Body of `GET /v1/join` (guide §4, "Capability Check and Server Info").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,8 +173,22 @@ pub struct NetherNetConfig {
     /// `0.0.0.0:0` = every interface, ephemeral port.
     pub udp_bind_addrs: Vec<SocketAddr>,
     /// Public IPs to advertise as server-reflexive (`srflx`) candidates when the
-    /// host is behind a 1:1 NAT (guide §7, step 11 note).
+    /// host is behind a 1:1 NAT (guide §7, step 11 note). Cannot be combined
+    /// with STUN servers in [`Self::ice_servers`].
     pub public_ips: Vec<IpAddr>,
+    /// STUN / TURN servers used to gather candidates (empty by default, like
+    /// the Minecraft client).
+    pub ice_servers: Vec<IceServer>,
+    /// Reverse proxies (e.g. an HTTPS terminator) allowed to report the real
+    /// client address through `Forwarded`, `X-Forwarded-For` or `X-Real-IP`.
+    /// These headers are ignored for every other peer, so a direct client
+    /// cannot spoof its address.
+    pub trusted_proxies: Vec<IpAddr>,
+    /// When the offer only contains non-routable candidates (client behind a
+    /// NAT) and the signaling request came from a routable address, add a
+    /// candidate built from that address and the port of the client's `host`
+    /// candidate. Helps hole punching when the client's NAT preserves ports.
+    pub infer_client_candidates: bool,
     /// Advertise loopback candidates (only useful for local testing).
     pub include_loopback_candidates: bool,
     /// Upper bound for one SCTP message we send (header included). The value
@@ -136,6 +223,9 @@ impl Default for NetherNetConfig {
             authorizer: None,
             udp_bind_addrs: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)],
             public_ips: Vec::new(),
+            ice_servers: Vec::new(),
+            trusted_proxies: Vec::new(),
+            infer_client_candidates: false,
             include_loopback_candidates: false,
             max_outgoing_message_size: 65_536,
             max_incoming_message_size: 16 * 1024 * 1024,
@@ -156,6 +246,9 @@ impl fmt::Debug for NetherNetConfig {
             .field("authorizer", &self.authorizer.as_ref().map(|_| ".."))
             .field("udp_bind_addrs", &self.udp_bind_addrs)
             .field("public_ips", &self.public_ips)
+            .field("ice_servers", &self.ice_servers.len())
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field("infer_client_candidates", &self.infer_client_candidates)
             .field(
                 "include_loopback_candidates",
                 &self.include_loopback_candidates,
@@ -180,6 +273,14 @@ impl NetherNetConfig {
         use crate::Error::Config;
         if self.udp_bind_addrs.is_empty() {
             return Err(Config("udp_bind_addrs must not be empty".into()));
+        }
+        for server in &self.ice_servers {
+            server.validate()?;
+        }
+        if !self.public_ips.is_empty() && self.ice_servers.iter().any(IceServer::has_stun_url) {
+            return Err(Config(
+                "public_ips (static srflx candidates) cannot be combined with STUN servers".into(),
+            ));
         }
         if !(2..=MAX_SCTP_MESSAGE_SIZE).contains(&self.max_outgoing_message_size) {
             return Err(Config(format!(
@@ -273,5 +374,35 @@ mod tests {
         for config in bad {
             assert!(config.validate().is_err(), "{config:?}");
         }
+    }
+
+    #[test]
+    fn ice_server_validation() {
+        assert!(
+            IceServer::stun("stun:stun.example.com:3478")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            IceServer::turn("turns:turn.example.com", "u", "p")
+                .validate()
+                .is_ok()
+        );
+        assert!(IceServer::stun("turn:turn.example.com").validate().is_err());
+        assert!(IceServer::stun("http://example.com").validate().is_err());
+        assert!(IceServer::default().validate().is_err());
+
+        let conflict = NetherNetConfig {
+            public_ips: vec!["203.0.113.5".parse().unwrap()],
+            ice_servers: vec![IceServer::stun("stun:stun.example.com")],
+            ..Default::default()
+        };
+        assert!(conflict.validate().is_err());
+        let turn_only = NetherNetConfig {
+            public_ips: vec!["203.0.113.5".parse().unwrap()],
+            ice_servers: vec![IceServer::turn("turn:turn.example.com", "u", "p")],
+            ..Default::default()
+        };
+        assert!(turn_only.validate().is_ok());
     }
 }

@@ -181,9 +181,34 @@ async fn has_reliable_semantics(dc: &Arc<dyn DataChannel>) -> bool {
         && matches!(dc.max_packet_life_time().await, Ok(None))
 }
 
+/// Who created a data channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChannelOrigin {
+    /// Opened by the remote peer (host side): already open when announced.
+    Remote,
+    /// Created locally (client side): must wait for its `OnOpen` event.
+    Local,
+}
+
+/// Waits until a locally created channel is open. Returns `false` if it
+/// closed first.
+async fn wait_local_open(dc: &Arc<dyn DataChannel>) -> bool {
+    loop {
+        match dc.poll().await {
+            Some(DataChannelEvent::OnOpen) => return true,
+            Some(DataChannelEvent::OnClose) | None => return false,
+            Some(_) => {}
+        }
+    }
+}
+
 /// Reads events of one data channel, applies NetherNet framing and forwards
 /// complete messages to the connection.
-pub(crate) async fn pump_data_channel(shared: Arc<Shared>, dc: Arc<dyn DataChannel>) {
+pub(crate) async fn pump_data_channel(
+    shared: Arc<Shared>,
+    dc: Arc<dyn DataChannel>,
+    origin: ChannelOrigin,
+) {
     let network_id = shared.network_id.as_str();
     let label = dc.label().await.unwrap_or_default();
     let Some(channel) = Channel::from_label(&label) else {
@@ -191,7 +216,18 @@ pub(crate) async fn pump_data_channel(shared: Arc<Shared>, dc: Arc<dyn DataChann
         let _ = dc.close().await;
         return;
     };
-    if channel == Channel::Reliable && !has_reliable_semantics(&dc).await {
+    if origin == ChannelOrigin::Local {
+        let opened = tokio::select! {
+            opened = wait_local_open(&dc) => opened,
+            () = shared.closed() => false,
+        };
+        if !opened {
+            if channel == Channel::Reliable {
+                shared.close();
+            }
+            return;
+        }
+    } else if channel == Channel::Reliable && !has_reliable_semantics(&dc).await {
         tracing::warn!(%network_id, "closing ReliableDataChannel opened as unordered/unreliable");
         let _ = dc.close().await;
         return;

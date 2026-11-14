@@ -3,17 +3,18 @@
 //! **MCBRS-NetherNet**: Minecraft Bedrock's NetherNet transport, written in Rust.
 //!
 //! NetherNet is Minecraft's peer-to-peer transport built on WebRTC data
-//! channels. This crate implements the *server* side of the
-//! "NetherNet HTTP Signaling" protocol:
+//! channels. This crate implements both sides of the "NetherNet HTTP
+//! Signaling" protocol: the host ([`NetherNetListener`], [`NetherNetHost`])
+//! and the client ([`NetherNetClient`]).
 //!
 //! | Guide section | Module |
 //! |---|---|
-//! | §4 HTTP signaling (`GET /v1/join`, `POST /v1/join/{networkId}`) | [`signaling`] |
-//! | §5.1 client assertion validation | [`identity::client`] |
-//! | §5.2 server assertion (operator key, TOFU) | [`identity::server`] |
-//! | §6 PeerConnection configuration, §7 connection flow | [`host`] |
+//! | §4 HTTP signaling (`GET /v1/join`, `POST /v1/join/{networkId}`), trusted proxies | [`signaling`] |
+//! | §5.1 client assertion: validation (host) and signing (client) | [`identity::client`], [`identity::sign_sdp`] |
+//! | §5.2 server assertion (operator key) and TOFU | [`identity::server`], [`client`] |
+//! | §6 PeerConnection configuration, §7 connection flow, STUN / TURN | [`host`], [`client`] |
 //! | §6.1 data framing / fragmentation | [`framing`] |
-//! | SDP helpers (`a=identity`, `a=fingerprint`) | [`sdp`] |
+//! | SDP helpers (`a=identity`, `a=fingerprint`, candidates) | [`sdp`] |
 //!
 //! The game protocol itself (packets, worlds, entities, ...) is out of scope:
 //! a [`NetherNetConnection`] simply delivers and accepts raw payloads on the
@@ -49,16 +50,22 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod client;
 pub mod config;
 pub mod conn;
 pub mod error;
 pub mod framing;
 pub mod host;
 pub mod identity;
+mod peer;
 pub mod sdp;
 pub mod signaling;
 
-pub use config::{Authorizer, ClientAuth, JoinRequest, NetherNetConfig, ServerInfo};
+pub use client::{
+    AcceptAnyServer, ClientCredentials, NetherNetClient, NetherNetClientConfig, ServerTrust,
+    TrustOnFirstUse, TrustRequest,
+};
+pub use config::{Authorizer, ClientAuth, IceServer, JoinRequest, NetherNetConfig, ServerInfo};
 pub use conn::{Channel, Message, NetherNetConnection, RELIABLE_LABEL, UNRELIABLE_LABEL};
 pub use error::{Error, Result};
 pub use host::{Incoming, NetherNetHost, NetherNetListener};

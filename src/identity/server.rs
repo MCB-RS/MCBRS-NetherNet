@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::jose::{self, SigningKey, VerifyingKey};
-use super::{IDP_PROTOCOL, IdentityAssertion, canonical};
+use super::{IdentityAssertion, sign_assertion};
 use crate::error::{Error, Result};
 use crate::sdp;
 
@@ -125,17 +125,7 @@ impl ServerIdentity {
 
     /// Builds the server assertion for an answer SDP (the base64 attribute value).
     pub fn assertion_for(&self, answer_sdp: &str) -> Result<IdentityAssertion> {
-        let fingerprints = sdp::fingerprints(answer_sdp);
-        if fingerprints.is_empty() {
-            return Err(Error::sdp("answer has no a=fingerprint line to sign"));
-        }
-        let payload = canonical::fingerprint_payload(&fingerprints);
-        Ok(IdentityAssertion {
-            domain: self.domain.clone(),
-            protocol: IDP_PROTOCOL.into(),
-            token: self.issue_token(),
-            fingerprints: jose::sign_detached(&self.key, payload.as_bytes()),
-        })
+        sign_assertion(answer_sdp, &self.domain, self.issue_token(), &self.key)
     }
 
     /// Returns `answer_sdp` with the session-level `a=identity` attribute added.
