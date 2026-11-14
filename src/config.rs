@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::client::{ClientIdentity, TokenVerifier};
 
+/// Bedrock protocol number used by [`ServerInfo::default`].
+pub const DEFAULT_PROTOCOL: u32 = 2225;
+
 /// Largest SCTP message this host advertises and can send (same value as the
 /// Minecraft client's `a=max-message-size`).
 pub const MAX_SCTP_MESSAGE_SIZE: usize = 262_144;
@@ -107,12 +110,15 @@ pub struct ServerInfo {
 }
 
 impl Default for ServerInfo {
-    /// Values taken from the guide's example; the application is expected to
-    /// overwrite them with the real protocol/version it implements.
+    /// Placeholder values; the application is expected to overwrite them with
+    /// the protocol and version it really implements. The protocol default is
+    /// the one announced by a real Minecraft client in its first packet
+    /// (`RequestNetworkSettings`, November 2026); the version string is the
+    /// guide's example.
     fn default() -> Self {
         Self {
             name: "NetherNet Server".into(),
-            protocol: 2177,
+            protocol: DEFAULT_PROTOCOL,
             version: "1.26.50".into(),
             level: "Bedrock level".into(),
             players: 0,
@@ -322,8 +328,10 @@ mod tests {
 
     #[test]
     fn server_info_json_matches_guide() {
+        // The guide's example body.
         let json = serde_json::to_value(ServerInfo {
             name: "Dedicated Server".into(),
+            protocol: 2177,
             max_players: 10,
             ..Default::default()
         })

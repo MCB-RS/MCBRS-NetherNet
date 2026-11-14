@@ -75,15 +75,11 @@ async fn main() -> mcbrs_nethernet::Result<()> {
 }
 ```
 
-A complete echo server is included:
+A complete test server is included, see [Testing with Minecraft](#testing-with-minecraft):
 
 ```bash
 cargo run --example nethernet_server -- 0.0.0.0:8080
 ```
-
-You can pass public IPs as extra arguments, for example
-`-- 0.0.0.0:8080 203.0.113.50`. The `NETHERNET_KEY` environment variable sets the key
-file path.
 
 ## Quick start: client
 
@@ -322,15 +318,60 @@ its own sockets, encryption and lifecycle. This crate therefore stays strictly s
 the documented HTTP signaling transport. A LAN discovery layer, if ever needed, belongs
 in a separate crate that hands its connections to the same WebRTC and framing code.
 
+## Testing with Minecraft
+
+`examples/nethernet_server.rs` is a transport test bench. It logs every join attempt
+(address, NetworkID, player identity) and every message (channel, size, first bytes in
+hex). It speaks no game protocol, so the client connects, sends its first packet, then
+gives up waiting for a game response.
+
+```bash
+cargo run --example nethernet_server -- 0.0.0.0:8080 [PUBLIC_IP...]
+```
+
+| Environment variable | Effect |
+|---|---|
+| `NETHERNET_AUTH=insecure` | Validates the player assertion (fingerprint signature, `cpk`, expiry) with an **unverified** token signature, and logs the player claims. |
+| `NETHERNET_UDP_BIND` | Comma-separated local IPs for WebRTC, e.g. your LAN IP, to skip VPN / virtual adapters. |
+| `NETHERNET_ECHO=1` | Sends every received payload back. |
+| `NETHERNET_STUN`, `NETHERNET_TRUSTED_PROXIES`, `NETHERNET_INFER=1` | The deployment options described above. |
+| `NETHERNET_NAME`, `NETHERNET_PROTOCOL`, `NETHERNET_VERSION`, `NETHERNET_MAX_PLAYERS` | Values served on `GET /v1/join`. |
+| `NETHERNET_KEY` | Operator key path (default `nethernet_server_key.pem`). |
+
+`examples/nethernet_client.rs` checks a server end to end without the game:
+
+```bash
+cargo run --example nethernet_client -- http://127.0.0.1:8080 [--fake-identity]
+```
+
+### Result with a real client (November 2026)
+
+The host was tested with a retail Minecraft Bedrock client over plaintext HTTP on a LAN.
+Every step of the guide succeeded:
+
+1. The offer arrived with a valid player assertion. The token was issued by
+   `https://authorization.franchise.minecraft-services.net/`, with an ES384 `cpk`, and
+   the fingerprint signature verified, which confirms the canonical JSON format.
+2. The client accepted the signed answer after its trust prompt.
+3. ICE, DTLS and SCTP connected in about 2 seconds, and both data channels opened.
+4. The first game packet arrived intact over the reliable channel: `06 c1 01 00 00 08 b1`,
+   which is `RequestNetworkSettings` with protocol 2225.
+5. The client disconnected cleanly when the player left the loading screen.
+
 ## Known limitations
 
-- **Tested against the guide, not against the real Minecraft client yet.** The test suite
-  uses `NetherNetClient` and a raw webrtc-rs peer that follow the official
-  documentation.
-- **Auth service keys**: the guide documents neither the Minecraft auth service public
-  keys nor the exact `GameServerToken` claims. `cpk` is accepted as a JWK or as base64
-  SPKI. The player claim names (`xid`, `pfid`, `uuid`...) are best guesses, and
-  `ClientIdentity::claim()` gives access to any other claim.
+- **Transport only**: the real client gets through to its first game packet. Answering it
+  (`NetworkSettings`, then login...) is the job of a game protocol layer built on top of
+  this crate.
+- **Auth service keys**: the guide does not document the Minecraft auth service public
+  keys, so `ClientAuth::Required` needs a `TokenVerifier` that you provide.
+  `JwkSetVerifier` works once you have those keys. `cpk` is accepted as a JWK (as sent
+  by the real client) or as base64 SPKI.
+- **Token claims**: real tokens contain `ap`, `aud`, `cpk`, `exp`, `iat`, `ipt`, `iss`,
+  `mid`, `pfcd`, `sub`, `tid`, `xid` and `xname`. `xuid()` and `display_name()` read
+  `xid` and `xname`. `playfab_id()` finds no claim under its expected names, because
+  the claim that carries the PlayFab ID is not documented. Use `ClientIdentity::claim()`
+  for anything else.
 - **No built-in TLS on the server side**: use a reverse proxy, together with
   `trusted_proxies`.
 - **No fixed UDP port**: each connection has its own ephemeral ports.
@@ -362,7 +403,8 @@ src/
 ├── config.rs        NetherNetConfig, IceServer, ServerInfo, ClientAuth, Authorizer
 ├── error.rs         Error type
 └── identity/        JWT / detached JWS, canonical JSON, client and server identities
-examples/nethernet_server.rs
+examples/nethernet_server.rs   transport test bench (see Testing with Minecraft)
+examples/nethernet_client.rs   end-to-end client check
 tests/end_to_end.rs
 ```
 

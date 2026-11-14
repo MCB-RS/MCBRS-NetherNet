@@ -169,6 +169,13 @@ impl TokenVerifier for InsecureTokenDecoder {
 }
 
 /// An authenticated player, extracted from a validated client assertion.
+///
+/// The guide does not list the `GameServerToken` claims. A real Minecraft
+/// client (November 2026) sent a token issued by
+/// `https://authorization.franchise.minecraft-services.net/` with these
+/// claims: `ap`, `aud`, `cpk` (JWK, ES384), `exp`, `iat`, `ipt`, `iss`, `mid`,
+/// `pfcd`, `sub`, `tid`, `xid` (XUID) and `xname` (gamertag). Use
+/// [`Self::claim`] for any claim without a dedicated accessor.
 #[derive(Debug, Clone)]
 pub struct ClientIdentity {
     /// `idp.domain` of the auth service that issued the token.
@@ -211,7 +218,8 @@ impl ClientIdentity {
         self.first_claim(&["xuid", "xid"])
     }
 
-    /// PlayFab ID (claim `PlayFabId` or `pfid`).
+    /// PlayFab ID (claim `PlayFabId` or `pfid`). Not present under these names
+    /// in the tokens observed so far; which claim carries it is not documented.
     pub fn playfab_id(&self) -> Option<String> {
         self.first_claim(&["playfabid", "pfid", "playfab_id"])
     }
@@ -221,9 +229,9 @@ impl ClientIdentity {
         self.first_claim(&["uuid", "identity"])
     }
 
-    /// Display name / gamertag, when present.
+    /// Display name / gamertag (claim `xname` in real tokens).
     pub fn display_name(&self) -> Option<String> {
-        self.first_claim(&["displayName", "gamertag", "xname", "name"])
+        self.first_claim(&["xname", "displayName", "gamertag", "name"])
     }
 }
 
@@ -322,6 +330,24 @@ m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n";
         assert!(lenient.verify(&token).is_ok());
         assert!(JwkSetVerifier::default().require_exp);
         assert_eq!(JwkSetVerifier::default().leeway_secs, 60);
+    }
+
+    #[test]
+    fn real_token_claim_layout() {
+        // Claim names of a real GameServerToken (values are made up).
+        let claims = serde_json::json!({
+            "ap": "x", "aud": "x", "exp": 1, "iat": 1, "ipt": "x", "iss": "x", "mid": "x",
+            "pfcd": 1, "sub": "x", "tid": "x", "xid": "2535400000000042", "xname": "Steve",
+            "cpk": SigningKey::generate().verifying_key().to_jwk(),
+        });
+        let id = ClientIdentity {
+            domain: "https://authorization.franchise.minecraft-services.net/".into(),
+            public_key: VerifyingKey::from_cpk_claim(&claims["cpk"]).unwrap(),
+            claims,
+        };
+        assert_eq!(id.xuid().as_deref(), Some("2535400000000042"));
+        assert_eq!(id.display_name().as_deref(), Some("Steve"));
+        assert_eq!(id.claim("pfcd").as_deref(), Some("1"));
     }
 
     #[test]
